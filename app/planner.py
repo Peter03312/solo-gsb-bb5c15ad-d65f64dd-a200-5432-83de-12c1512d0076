@@ -451,6 +451,111 @@ def _seat_bottlenecks(blocks, fixed, unavailable, start_year, start_season, scan
     return notes
 
 
+def schedule_course_set(catalog, courses, *, completed, equiv, lock_items=(),
+                        unavailable_idx=frozenset(), start_year, start_season,
+                        max_credits, num_semesters, seat_caps=None, occupied=None):
+    """尝试把一个候选课程集合排进期限，返回 (sched, error)。
+
+    成功：sched=(k, seq)、error=None；失败：sched=None、error=(kind, message)，
+    kind 为 'conflict'（结构性条件冲突）或 'no_solution'（期限/学分/席位导致无解）。
+    供 build_plan 与培养方案达成课表共用，诊断口径保持一致。
+    """
+    seat_caps = seat_caps or {}
+    occupied = occupied or {}
+    try:
+        blocks = _build_blocks(catalog, courses)
+    except PlanError as exc:
+        return None, ("conflict", exc.message)
+    reqs = _block_requirements(catalog, completed, blocks, equiv)
+    if reqs is None:
+        return None, ("conflict", "先修条件无法满足，条件冲突")
+    try:
+        fixed = _fixed_assignments(blocks, lock_items, start_season)
+    except PlanError as exc:
+        return None, ("conflict", exc.message)
+    heavy = next((b for b in blocks if b.credits > max_credits), None)
+    if heavy is not None:
+        return None, ("no_solution",
+                      f"同修课程 {'+'.join(heavy.codes)} 学分合计 {heavy.credits} "
+                      f"超过每学期学分上限 {max_credits}")
+    seats = (seat_caps or {}, occupied or {})
+    sched = _schedule(blocks, reqs, num_semesters, start_year, start_season, max_credits,
+                      fixed=fixed, unavailable=unavailable_idx, seats=seats)
+    if sched is not None:
+        return sched, None
+    scan_k = max(num_semesters, 2 * len(blocks) + 2)
+    # 判定 1：保持原期限与学分上限，仅去掉席位约束
+    seatless_same = _schedule(
+        blocks, reqs, num_semesters, start_year, start_season, max_credits,
+        fixed=fixed, unavailable=unavailable_idx) if seat_caps else None
+    if seatless_same is not None:
+        # 纯席位导致的期限内无解：定位“最短无席位解”上无余位的课程学期
+        _, seq0 = seatless_same
+        details = []
+        for i, codes in enumerate(seq0, start=1):
+            label = semester_label(start_year, start_season, i)
+            for c in codes:
+                limit = seat_caps.get((c, label))
+                if limit is not None:
+                    occ = occupied.get((c, label), 0)
+                    if occ >= limit:
+                        details.append(f"{c} 在 {label} 席位已满"
+                                       f"（上限 {limit}，已占用 {occ}）")
+        return None, ("no_solution",
+                      f"受席位余量限制，{num_semesters} 个学期内无法排完所需课程："
+                      + ("；".join(details[:3]) if details else "相关课程学期席位余量不足"))
+    # 判定 2：放宽学期数与学分上限（席位上限保留）
+    relaxed = _schedule(blocks, reqs, scan_k, start_year, start_season,
+                        sum(b.credits for b in blocks),
+                        fixed=fixed, unavailable=unavailable_idx, seats=seats)
+    if relaxed is not None:
+        factors = []
+        if lock_items:
+            factors.append("锁定安排")
+        if unavailable_idx:
+            factors.append("不可排课学期")
+        factors += ["开课学期", "先修顺序"]
+        return None, ("no_solution",
+                      f"受{'、'.join(factors)}或每学期学分上限 {max_credits} 限制，"
+                      f"{num_semesters} 个学期内无法排完所需课程")
+    # 放宽学期与学分仍不行：去掉席位上限再试，区分结构性冲突与席位封死
+    seatless = _schedule(blocks, reqs, scan_k, start_year, start_season,
+                         sum(b.credits for b in blocks),
+                         fixed=fixed, unavailable=unavailable_idx)
+    if seatless is not None and seat_caps:
+        notes = _seat_bottlenecks(blocks, fixed, unavailable_idx, start_year, start_season,
+                                  scan_k, seat_caps, occupied)
+        return None, ("no_solution",
+                      "受席位余量限制，放宽学期数与学分上限仍无法排出课表："
+                      + "；".join(notes[:3]))
+    dead = "、".join(_deadlocked_codes(blocks, reqs))
+    if lock_items:
+        note = "锁定安排与先修/同修条件冲突，无法排出满足全部锁定的课表"
+        note += f"，涉及课程：{dead}" if dead else ""
+    else:
+        note = f"先修条件存在循环依赖或无法满足，涉及课程：{dead}"
+    return None, ("conflict", note)
+
+
+def format_schedule(catalog, start_year, start_season, k, seq):
+    """(k, seq) 排课结果 -> 对外的课表结构（学分取自所给目录版本）。"""
+    semesters = []
+    for i, codes in enumerate(seq, start=1):
+        courses_in_sem = [
+            {"code": c, "name": catalog[c].name, "credits": catalog[c].credits} for c in codes
+        ]
+        semesters.append({
+            "semester": semester_label(start_year, start_season, i),
+            "courses": courses_in_sem,
+            "total_credits": sum(c["credits"] for c in courses_in_sem),
+        })
+    return {
+        "completion_semester": semester_label(start_year, start_season, k),
+        "total_credits": sum(s["total_credits"] for s in semesters),
+        "semesters": semesters,
+    }
+
+
 # ---------------------------------------------------------------- 主入口
 
 def build_plan(catalog, completed, targets, start_semester, max_credits, num_semesters,
@@ -542,86 +647,18 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
     no_solution_notes = []
 
     for courses in leaves:
-        try:
-            blocks = _build_blocks(catalog, courses)
-        except PlanError as exc:
-            conflicts.append(exc.message)
-            continue
-        reqs = _block_requirements(catalog, completed, blocks, equiv)
-        if reqs is None:
-            conflicts.append("先修条件无法满足，条件冲突")
-            continue
-        try:
-            fixed = _fixed_assignments(blocks, lock_items, start_season)
-        except PlanError as exc:
-            conflicts.append(exc.message)
-            continue
-        heavy = next((b for b in blocks if b.credits > max_credits), None)
-        if heavy is not None:
-            no_solution_notes.append(
-                f"同修课程 {'+'.join(heavy.codes)} 学分合计 {heavy.credits} "
-                f"超过每学期学分上限 {max_credits}")
-            continue
-        seats = (seat_caps, occupied)
-        sched = _schedule(blocks, reqs, num_semesters, start_year, start_season, max_credits,
-                          fixed=fixed, unavailable=unavailable_idx, seats=seats)
+        sched, error = schedule_course_set(
+            catalog, courses, completed=completed, equiv=equiv,
+            lock_items=lock_items, unavailable_idx=unavailable_idx,
+            start_year=start_year, start_season=start_season,
+            max_credits=max_credits, num_semesters=num_semesters,
+            seat_caps=seat_caps, occupied=occupied)
         if sched is None:
-            scan_k = max(num_semesters, 2 * len(blocks) + 2)
-            # 判定 1：保持原期限与学分上限，仅去掉席位约束
-            seatless_same = _schedule(
-                blocks, reqs, num_semesters, start_year, start_season, max_credits,
-                fixed=fixed, unavailable=unavailable_idx) if seat_caps else None
-            if seatless_same is not None:
-                # 纯席位导致的期限内无解：定位“最短无席位解”上无余位的课程学期
-                _, seq0 = seatless_same
-                details = []
-                for i, codes in enumerate(seq0, start=1):
-                    label = semester_label(start_year, start_season, i)
-                    for c in codes:
-                        limit = seat_caps.get((c, label))
-                        if limit is not None:
-                            occ = occupied.get((c, label), 0)
-                            if occ >= limit:
-                                details.append(f"{c} 在 {label} 席位已满"
-                                               f"（上限 {limit}，已占用 {occ}）")
-                no_solution_notes.append(
-                    f"受席位余量限制，{num_semesters} 个学期内无法排完所需课程："
-                    + ("；".join(details[:3]) if details else "相关课程学期席位余量不足"))
-                continue
-            # 判定 2：放宽学期数与学分上限（席位上限保留）
-            relaxed = _schedule(blocks, reqs, scan_k, start_year, start_season,
-                                sum(b.credits for b in blocks),
-                                fixed=fixed, unavailable=unavailable_idx, seats=seats)
-            if relaxed is None:
-                # 放宽学期与学分仍不行：去掉席位上限再试，区分结构性冲突与席位封死
-                seatless = _schedule(blocks, reqs, scan_k, start_year, start_season,
-                                     sum(b.credits for b in blocks),
-                                     fixed=fixed, unavailable=unavailable_idx)
-                if seatless is not None and seat_caps:
-                    notes = _seat_bottlenecks(blocks, fixed, unavailable_idx,
-                                              start_year, start_season, scan_k,
-                                              seat_caps, occupied)
-                    no_solution_notes.append(
-                        "受席位余量限制，放宽学期数与学分上限仍无法排出课表："
-                        + "；".join(notes[:3]))
-                else:
-                    dead = "、".join(_deadlocked_codes(blocks, reqs))
-                    if lock_items:
-                        note = "锁定安排与先修/同修条件冲突，无法排出满足全部锁定的课表"
-                        note += f"，涉及课程：{dead}" if dead else ""
-                    else:
-                        note = f"先修条件存在循环依赖或无法满足，涉及课程：{dead}"
-                    conflicts.append(note)
+            kind, message = error
+            if kind == "no_solution":
+                no_solution_notes.append(message)
             else:
-                factors = []
-                if lock_items:
-                    factors.append("锁定安排")
-                if unavailable_idx:
-                    factors.append("不可排课学期")
-                factors += ["开课学期", "先修顺序"]
-                note = (f"受{'、'.join(factors)}或每学期学分上限 {max_credits} 限制，"
-                        f"{num_semesters} 个学期内无法排完所需课程")
-                no_solution_notes.append(note)
+                conflicts.append(message)
             continue
         if best is None or sched < best:
             best = sched
@@ -633,18 +670,4 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
                         conflicts[0] if conflicts else "先修/同修条件冲突，无法生成方案")
 
     k, seq = best
-    semesters = []
-    for i, codes in enumerate(seq, start=1):
-        courses_in_sem = [
-            {"code": c, "name": catalog[c].name, "credits": catalog[c].credits} for c in codes
-        ]
-        semesters.append({
-            "semester": semester_label(start_year, start_season, i),
-            "courses": courses_in_sem,
-            "total_credits": sum(c["credits"] for c in courses_in_sem),
-        })
-    return {
-        "completion_semester": semester_label(start_year, start_season, k),
-        "total_credits": sum(s["total_credits"] for s in semesters),
-        "semesters": semesters,
-    }
+    return format_schedule(catalog, start_year, start_season, k, seq)

@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS plans (
     status TEXT NOT NULL DEFAULT 'proposed',  -- proposed / confirmed / draft
     created_at TEXT NOT NULL,
     source_plan_id TEXT REFERENCES plans(id), -- 滚动重排草案关联的原方案；非草案为 NULL
-    replan_json TEXT                          -- 草案的重排上下文与差异；非草案为 NULL
+    replan_json TEXT,                         -- 草案的重排上下文与差异；非草案为 NULL
+    attribution_json TEXT                     -- 培养方案达成课表的预计归属；普通规划为 NULL
 );
 CREATE TABLE IF NOT EXISTS equiv_groups (
     version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
@@ -88,6 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_audits_requirement ON audits(requirement_version_
 MIGRATIONS = (
     "ALTER TABLE plans ADD COLUMN source_plan_id TEXT REFERENCES plans(id)",
     "ALTER TABLE plans ADD COLUMN replan_json TEXT",
+    "ALTER TABLE plans ADD COLUMN attribution_json TEXT",
 )
 
 
@@ -210,12 +212,13 @@ def load_equiv_groups(conn, version_id):
     return [groups[k] for k in sorted(groups)]
 
 
-def insert_plan(conn, plan_id, version_id, request, result):
+def insert_plan(conn, plan_id, version_id, request, result, attribution=None):
     conn.execute(
-        "INSERT INTO plans (id, version_id, request_json, result_json, status, created_at)"
-        " VALUES (?,?,?,?,?,?)",
+        "INSERT INTO plans (id, version_id, request_json, result_json, status, created_at,"
+        " attribution_json) VALUES (?,?,?,?,?,?,?)",
         (plan_id, version_id, json.dumps(request, ensure_ascii=False),
-         json.dumps(result, ensure_ascii=False), "proposed", _now()),
+         json.dumps(result, ensure_ascii=False), "proposed", _now(),
+         json.dumps(attribution, ensure_ascii=False) if attribution is not None else None),
     )
 
 

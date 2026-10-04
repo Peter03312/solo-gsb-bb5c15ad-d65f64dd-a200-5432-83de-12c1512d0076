@@ -12,8 +12,9 @@ from fastapi.responses import JSONResponse
 from . import db
 from .audit import run_audit
 from .planner import Course, PlanError, build_plan, parse_semester
+from .program_plan import build_program_plan
 from .replan import replan_plan
-from .schemas import (AuditIn, CatalogIn, PlanIn, ReplanIn,
+from .schemas import (AuditIn, CatalogIn, PlanIn, ProgramPlanIn, ReplanIn,
                       RequirementVersionIn, SeatCapIn)
 
 
@@ -56,11 +57,12 @@ def _to_catalog(rows):
 
 
 def _plan_out(row):
+    request_data = json.loads(row["request_json"])
     out = {
         "plan_id": row["id"],
         "status": row["status"],
         "catalog_version": row["version_id"],
-        "request": json.loads(row["request_json"]),
+        "request": request_data,
         "result": json.loads(row["result_json"]),
         "created_at": row["created_at"],
     }
@@ -68,6 +70,13 @@ def _plan_out(row):
     if source:
         out["source_plan_id"] = source
         out["replan"] = json.loads(row["replan_json"])
+    attribution = row["attribution_json"] if "attribution_json" in row.keys() else None
+    if attribution:
+        out["attribution"] = json.loads(attribution)
+        # 培养方案达成课表：回显类型与绑定信息，便于与普通规划区分、回看
+        out["plan_type"] = "program_plan"
+        out["requirement_version_id"] = request_data.get("requirement_version_id")
+        out["bound_catalog_version"] = request_data.get("bound_catalog_version")
     return out
 
 
@@ -314,6 +323,112 @@ def get_audit(audit_id: str):
             raise HTTPException(status_code=404, detail={
                 "code": "NOT_FOUND", "message": f"审核 {audit_id} 不存在"})
     return db.audit_out(row)
+
+
+# ---------------------------------------------------------------- 培养方案达成课表
+
+@app.post("/requirement-versions/{rv_id}/plans", status_code=201)
+def create_program_plan(rv_id: str, payload: ProgramPlanIn):
+    """凭要求版本、累计已修与规划期限生成达成课表。
+
+    要求绑定目录决定互认与计入学分（仅两版目录均有的拟修课可计入要求，当前目录独有
+    课程只作先修/同修必要课）；当前目录决定开课、先修、同修、排课学分与席位。返回期限
+    内最早完成（同完成学期按学期课程代码序列字典序决胜）的完整课表，以及合并已修与
+    拟修后的预计归属（一门课只归属一项、同互认组至多计一门）。
+
+    已全部达成时返回 200 空课表（不保存）；未知要求版本 404、未知已修课 422、期限内
+    无解 422 且不保存部分方案。课表待确认、不预占席位；确认沿用既有
+    `POST /plans/{id}/confirm`（目录版本与席位原子复核）。
+    """
+    with db.session() as conn:
+        rv = db.get_requirement_version(conn, rv_id)
+        if rv is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"要求版本 {rv_id} 不存在"})
+        version = db.get_current_version(conn)
+        catalog = _to_catalog(db.load_courses(conn, version["id"]))
+        current_equiv = db.load_equiv_groups(conn, version["id"])
+        bound_rows = db.load_courses(conn, rv["catalog_version_id"])
+        bound_equiv = db.load_equiv_groups(conn, rv["catalog_version_id"])
+        seat_caps = db.load_seat_caps(conn)
+        occupied = db.seat_occupied_map(conn)
+        content = json.loads(rv["content_json"])
+        try:
+            schedule, attribution = build_program_plan(
+                bound_rows=bound_rows,
+                bound_equiv_groups=bound_equiv,
+                current_catalog=catalog,
+                current_equiv_groups=current_equiv,
+                required=content["required_courses"],
+                elective_groups=content["elective_groups"],
+                completed=set(payload.completed_courses),
+                start_semester=payload.start_semester,
+                max_credits=payload.max_credits_per_semester,
+                num_semesters=payload.num_semesters,
+                seat_caps=seat_caps,
+                occupied=occupied,
+            )
+        except PlanError as exc:
+            status = 400 if exc.code == "INVALID_INPUT" else 422
+            raise HTTPException(status_code=status,
+                                detail={"code": exc.code, "message": exc.message})
+
+        # 已达成：空课表，不保存、不占位
+        if schedule is None:
+            return JSONResponse(status_code=200, content={
+                "plan_id": None,
+                "status": "already_achieved",
+                "plan_type": "program_plan",
+                "requirement_version_id": rv_id,
+                "catalog_version": version["id"],
+                "bound_catalog_version": rv["catalog_version_id"],
+                "request": payload.model_dump(),
+                "result": {
+                    "completion_semester": None,
+                    "total_credits": 0,
+                    "semesters": [],
+                    "message": "全部必修与选修学分要求均已达成，无需排课",
+                },
+                "attribution": {
+                    "requirement_version_id": rv_id,
+                    "bound_catalog_version": rv["catalog_version_id"],
+                    "completed_courses": payload.completed_courses,
+                    "result": attribution,
+                },
+            })
+
+        # 落库前复查：目录在计算期间被修订则拒绝旧版本结果（409，不保存）
+        current = db.get_current_version(conn)
+        if current["id"] != version["id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "CATALOG_CHANGED",
+                "message": f"目录在规划期间已修订（计算基于版本 {version['id']}，"
+                           f"当前版本 {current['id']}），旧版本结果被拒绝，请重新发起",
+            })
+
+        plan_id = uuid.uuid4().hex[:12]
+        request_data = {
+            "plan_type": "program_plan",
+            "requirement_version_id": rv_id,
+            "bound_catalog_version": rv["catalog_version_id"],
+            "completed_courses": payload.completed_courses,
+            # 以全部拟修课程作为普通规划目标回看：可确认、可重放；达成语义以归属为准
+            "target_courses": sorted(
+                {c["code"] for s in schedule["semesters"] for c in s["courses"]}),
+            "start_semester": payload.start_semester,
+            "max_credits_per_semester": payload.max_credits_per_semester,
+            "num_semesters": payload.num_semesters,
+        }
+        projected = {
+            "requirement_version_id": rv_id,
+            "bound_catalog_version": rv["catalog_version_id"],
+            "completed_courses": payload.completed_courses,
+            "result": attribution,
+        }
+        db.insert_plan(conn, plan_id, version["id"], request_data, schedule,
+                       attribution=projected)
+        row = db.get_plan(conn, plan_id)
+    return _plan_out(row)
 
 
 # ---------------------------------------------------------------- 席位上限

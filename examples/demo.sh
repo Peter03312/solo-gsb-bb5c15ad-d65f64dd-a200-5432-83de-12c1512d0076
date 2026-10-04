@@ -352,4 +352,65 @@ curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/au
   -H 'Content-Type: application/json' -d '{"completed_courses": ["UNKNOWN"]}'
 echo "要求版本列表（BAD 无任何版本）："
 curl -s "$BASE/programs/BAD/requirement-versions"; echo
+
+step "48. 培养方案达成课表：凭要求版本+已修+期限，求最早达成全部必修与选修门槛的课表"
+PP=$(curl -s -X POST "$BASE/requirement-versions/$RV_ID/plans" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101", "CS101L", "CS201", "MATH101", "MATH103"],
+    "start_semester": "2026-SPRING",
+    "max_credits_per_semester": 12,
+    "num_semesters": 6
+  }')
+echo "$PP" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('plan_id:', d['plan_id'], 'status:', d['status'], 'plan_type:', d['plan_type'])
+print('当前目录版本:', d['catalog_version'], '要求绑定目录版本:', d['bound_catalog_version'])
+for s in d['result']['semesters']:
+    print(' ', s['semester'], [c['code'] for c in s['courses']], s['total_credits'], '学分')
+print('完成学期:', d['result']['completion_semester'])
+r=d['attribution']['result']
+print('预计达成:', r['achieved'])
+for q in r['required']:
+    a=q['attributed_course']
+    print(' 必修', q['code'], '<-', a['code'], a['via']) if a else print(' 必修', q['code'], '未满足')
+for g in r['elective_groups']:
+    print(' 选修', g['name'], '计入', g['counted_credits'], '学分 缺口', g['credit_gap'],
+          [(c['code'], c['via']) for c in g['attributed_courses']])
+print(' 未归属课程:', [c['code'] for c in r['unattributed_courses']])
+"
+PP_ID=$(echo "$PP" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+echo "待确认不占位（CS401@2026-FALL occupied 应为 0）："
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+
+step "49. 确认达成课表（沿用既有确认接口：原子复核目录版本与席位后占位）"
+curl -s -X POST "$BASE/plans/$PP_ID/confirm" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('status:', d['status'])"
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+echo "拟修课未写成历史审核，仅作为待确认/已确认方案的 attribution 回看："
+curl -s "$BASE/plans/$PP_ID" | python3 -c "import sys,json;d=json.load(sys.stdin);print('plan_type:', d['plan_type'], '有 attribution:', 'attribution' in d)"
+
+step "50. 已修已达成全部要求：返回 200 空课表（不保存、不占位、不写审核）"
+curl -s -w 'HTTP %{http_code}' -X POST "$BASE/requirement-versions/$RV_ID/plans" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101","CS201","CS302","CS402","CS303","MATH101","MATH103"],
+    "start_semester": "2026-SPRING",
+    "max_credits_per_semester": 12,
+    "num_semesters": 6
+  }' | python3 -c "
+import sys,json
+raw=sys.stdin.read()
+body, _, code = raw.rpartition('HTTP ')
+d=json.loads(body)
+print('HTTP', code.strip(), 'status:', d['status'], 'plan_id:', d['plan_id'],
+      '空课表:', d['result']['semesters'], '预计达成:', d['attribution']['result']['achieved'])
+"
+
+step "51. 达成课表错误示例：未知要求版本（404）/ 未知已修课（422）/ 期限内无解（422），均不保存"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/NOPE:v1/plans" \
+  -H 'Content-Type: application/json' -d '{"start_semester":"2026-SPRING","max_credits_per_semester":12,"num_semesters":6}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/plans" \
+  -H 'Content-Type: application/json' -d '{"completed_courses":["UNKNOWN"],"start_semester":"2026-SPRING","max_credits_per_semester":12,"num_semesters":6}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/plans" \
+  -H 'Content-Type: application/json' -d '{"completed_courses":[],"start_semester":"2026-SPRING","max_credits_per_semester":12,"num_semesters":2}'
 echo done
