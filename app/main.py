@@ -11,9 +11,10 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .audit import run_audit
+from .completion import build_completion_plan
 from .planner import Course, PlanError, build_plan, parse_semester
 from .replan import replan_plan
-from .schemas import (AuditIn, CatalogIn, PlanIn, ReplanIn,
+from .schemas import (AuditIn, CatalogIn, CompletionPlanIn, PlanIn, ReplanIn,
                       RequirementVersionIn, SeatCapIn)
 
 
@@ -56,11 +57,12 @@ def _to_catalog(rows):
 
 
 def _plan_out(row):
+    request = json.loads(row["request_json"])
     out = {
         "plan_id": row["id"],
         "status": row["status"],
         "catalog_version": row["version_id"],
-        "request": json.loads(row["request_json"]),
+        "request": request,
         "result": json.loads(row["result_json"]),
         "created_at": row["created_at"],
     }
@@ -68,6 +70,17 @@ def _plan_out(row):
     if source:
         out["source_plan_id"] = source
         out["replan"] = json.loads(row["replan_json"])
+    if request.get("kind") == "completion":
+        # 培养方案达成课表：回显要求版本与双目录版本，及合并已修与拟修后的预计归属
+        result = out["result"]
+        out["plan_kind"] = "completion"
+        out["requirement_version_id"] = request["requirement_version_id"]
+        out["bound_catalog_version"] = request["bound_catalog_version_id"]
+        out["schedule"] = result["schedule"]
+        out["projected_attribution"] = result["projected_attribution"]
+        out["current_only_courses"] = result.get("current_only_courses", [])
+        out["achieved"] = result["achieved"]
+        out["result"] = result["schedule"]
     return out
 
 
@@ -316,6 +329,78 @@ def get_audit(audit_id: str):
     return db.audit_out(row)
 
 
+# ---------------------------------------------------------------- 培养方案达成课表
+
+@app.post("/requirement-versions/{rv_id}/completion-plans", status_code=201)
+def create_completion_plan(rv_id: str, payload: CompletionPlanIn):
+    """凭要求版本 + 累计已修 + 起始学期/学分上限/学期数，生成期限内最早达成的课表。
+
+    绑定目录（要求版本登记时绑定）决定互认与计入学分；当前目录决定未来课程的
+    开课、先修、同修、排课学分与席位余量；仅两版目录均有的拟修课可计入要求，
+    当前目录独有课只作先修等必要课程。拟修课不写成历史已修；课表待确认、不预占
+    席位（确认沿用既有 /plans/{id}/confirm：按当前目录版本与席位原子复核）。
+
+    - 已达成：返回空课表并保存为待确认记录（结果中带预计归属）；
+    - 未知要求版本 -> 404；未知已修课、结构不可达成、期限内无解 -> 422 且不保存；
+    - 计算至落库间目录被修订 -> 409 CATALOG_CHANGED 且不保存。
+    """
+    with db.session() as conn:
+        rv_row = db.get_requirement_version(conn, rv_id)
+        if rv_row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"要求版本 {rv_id} 不存在"})
+        version = db.get_current_version(conn)
+        current_catalog = _to_catalog(db.load_courses(conn, version["id"]))
+        current_groups = db.load_equiv_groups(conn, version["id"])
+        bound_catalog_id = rv_row["catalog_version_id"]
+        bound_rows = db.load_courses(conn, bound_catalog_id)
+        bound_credits = {r["code"]: r["credits"] for r in bound_rows}
+        bound_groups = db.load_equiv_groups(conn, bound_catalog_id)
+        content = json.loads(rv_row["content_json"])
+        seat_caps = db.load_seat_caps(conn)
+        occupied = db.seat_occupied_map(conn)
+        try:
+            outcome = build_completion_plan(
+                current_catalog=current_catalog,
+                current_equiv_groups=current_groups,
+                bound_credits=bound_credits,
+                bound_equiv_groups=bound_groups,
+                required=content["required_courses"],
+                elective_groups=content["elective_groups"],
+                completed=set(payload.completed_courses),
+                start_semester=payload.start_semester,
+                max_credits=payload.max_credits_per_semester,
+                num_semesters=payload.num_semesters,
+                seat_caps=seat_caps,
+                occupied=occupied,
+            )
+        except PlanError as exc:
+            status = 400 if exc.code == "INVALID_INPUT" else 422
+            raise HTTPException(status_code=status,
+                                detail={"code": exc.code, "message": exc.message})
+        # 落库前复查：目录在计算期间被修订则拒绝旧版本结果，不保存
+        current = db.get_current_version(conn)
+        if current["id"] != version["id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "CATALOG_CHANGED",
+                "message": f"目录在达成课表计算期间已修订（计算基于版本 {version['id']}，"
+                           f"当前版本 {current['id']}），旧版本结果被拒绝，请重新发起",
+            })
+        request_data = {
+            "kind": "completion",
+            "requirement_version_id": rv_id,
+            "bound_catalog_version_id": bound_catalog_id,
+            "completed_courses": payload.completed_courses,
+            "start_semester": payload.start_semester,
+            "max_credits_per_semester": payload.max_credits_per_semester,
+            "num_semesters": payload.num_semesters,
+        }
+        plan_id = uuid.uuid4().hex[:12]
+        db.insert_plan(conn, plan_id, version["id"], request_data, outcome)
+        row = db.get_plan(conn, plan_id)
+    return _plan_out(row)
+
+
 # ---------------------------------------------------------------- 席位上限
 @app.put("/seat-caps/{course_code}/{semester}")
 def set_seat_cap(course_code: str, semester: str, payload: SeatCapIn):
@@ -405,13 +490,19 @@ def list_plans():
         rows = db.list_plans(conn)
     out = []
     for r in rows:
+        result = json.loads(r["result_json"])
+        request = json.loads(r["request_json"])
         item = {
             "plan_id": r["id"],
             "status": r["status"],
             "catalog_version": r["version_id"],
-            "completion_semester": json.loads(r["result_json"]).get("completion_semester"),
+            "completion_semester": result.get(
+                "completion_semester", result.get("schedule", {}).get("completion_semester")),
             "created_at": r["created_at"],
         }
+        if request.get("kind") == "completion":
+            item["plan_kind"] = "completion"
+            item["requirement_version_id"] = request["requirement_version_id"]
         if r["source_plan_id"]:
             item["source_plan_id"] = r["source_plan_id"]
         out.append(item)
@@ -433,9 +524,11 @@ def _placements_from_result(result):
     """方案结果 -> [(实际修读课程代码, 学期标签), ...]。
 
     互认按实际修读课程占位：方案列出替代课就占替代课名额，不计入原课名额。
+    培养方案达成课表的课表存放在 result.schedule 中。
     """
+    schedule = result.get("schedule", result)
     placements = []
-    for s in result.get("semesters", []):
+    for s in schedule.get("semesters", []):
         for c in s.get("courses", []):
             placements.append((c["code"], s["semester"]))
     return placements
@@ -546,6 +639,11 @@ def replan_plan_route(plan_id: str, payload: ReplanIn):
                 "code": "PLAN_NOT_CONFIRMED",
                 "message": f"方案 {plan_id} 状态为 {row['status']}，仅已确认方案可滚动重排",
             })
+
+        if json.loads(row["request_json"]).get("kind") == "completion":
+            raise HTTPException(status_code=400, detail={
+                "code": "INVALID_INPUT",
+                "message": "培养方案达成课表不支持滚动重排；请凭最新已修课程重新发起达成课表申请"})
 
         original_request = json.loads(row["request_json"])
         original_result = json.loads(row["result_json"])

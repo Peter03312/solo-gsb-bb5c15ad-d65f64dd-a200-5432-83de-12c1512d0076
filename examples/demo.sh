@@ -352,4 +352,40 @@ curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/au
   -H 'Content-Type: application/json' -d '{"completed_courses": ["UNKNOWN"]}'
 echo "要求版本列表（BAD 无任何版本）："
 curl -s "$BASE/programs/BAD/requirement-versions"; echo
+
+step "48. 培养方案达成课表：凭要求版本+累计已修+学期参数自动求最早达成课表（201，待确认不占位）"
+CP=$(curl -s -X POST "$BASE/requirement-versions/$RV_ID/completion-plans" \
+  -H 'Content-Type: application/json' \
+  -d @"$HERE/completion_plan.json")
+echo "$CP"
+CP_ID=$(echo "$CP" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+
+step "49. 达成课表确认（沿用既有确认接口：原子复核目录版本与席位）"
+curl -s -X POST "$BASE/plans/$CP_ID/confirm"; echo
+echo "席位按实际修读课程占位（CS401@2026-FALL）："
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+
+step "50. 达成课表：已全部达成 -> 空课表（completion_semester=null，仍保存待确认记录）"
+curl -s -X POST "$BASE/requirement-versions/$RV_ID/completion-plans" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101","CS201","CS302","CS402","CS303","MATH101","MATH103"],
+    "start_semester": "2026-SPRING",
+    "max_credits_per_semester": 12,
+    "num_semesters": 6
+  }' | python3 -c "import sys,json;d=json.load(sys.stdin);print('semesters:',d['schedule']['semesters'],'achieved:',d['achieved'])"
+
+step "51. 达成课表错误示例：未知要求版本(404)/未知已修课(422)/期限内无解(422)/不支持重排(400)"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/NOPE:v9/completion-plans" \
+  -H 'Content-Type: application/json' -d @"$HERE/completion_plan.json"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/completion-plans" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["UNKNOWN"], "start_semester": "2026-SPRING",
+    "max_credits_per_semester": 12, "num_semesters": 6}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/completion-plans" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": [], "start_semester": "2026-SPRING",
+    "max_credits_per_semester": 12, "num_semesters": 1}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$CP_ID/replan" \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_semesters": 1, "completed_courses": ["CS101"]}'
 echo done

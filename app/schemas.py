@@ -225,3 +225,22 @@ class AuditIn(BaseModel):
     @classmethod
     def norm_codes(cls, v):
         return sorted({_norm_code(x) for x in v if x.strip()})
+
+
+class CompletionPlanIn(BaseModel):
+    """培养方案达成课表申请：要求版本 + 累计已修 + 起始学期 + 学分上限 + 规划学期数。
+
+    已修课程必须在要求版本绑定的目录版本中存在；当前目录决定未来课程的开课、
+    先修、同修、排课学分与席位；仅两版目录均有的拟修课可计入要求。
+    """
+
+    completed_courses: list[str] = Field(
+        default_factory=list, description="累计已修课程代码（须在要求绑定目录中存在）")
+    start_semester: str = Field(description="起始学期，如 2026-SPRING")
+    max_credits_per_semester: int = Field(gt=0, description="每学期学分上限，必须为正")
+    num_semesters: int = Field(gt=0, description="规划学期数，必须为正")
+
+    @field_validator("completed_courses")
+    @classmethod
+    def norm_codes(cls, v):
+        return sorted({_norm_code(x) for x in v if x.strip()})

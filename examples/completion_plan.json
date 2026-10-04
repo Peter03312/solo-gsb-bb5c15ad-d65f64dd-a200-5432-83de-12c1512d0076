@@ -1,0 +1,6 @@
+{
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103"],
+  "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12,
+  "num_semesters": 6
+}
